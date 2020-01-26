@@ -10,6 +10,7 @@ from baselines.common.atari_wrappers import make_atari, wrap_deepmind
 from baselines.common.vec_env import VecEnvWrapper
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.shmem_vec_env import ShmemVecEnv
+from baselines.common.vec_env import SubprocVecEnv
 from baselines.common.vec_env.vec_normalize import \
     VecNormalize as VecNormalize_
 
@@ -88,7 +89,7 @@ def make_vec_envs(env_name,
     ]
 
     if len(envs) > 1:
-        envs = ShmemVecEnv(envs, context='fork')
+        envs = SubprocVecEnv(envs, context='fork')
     else:
         envs = DummyVecEnv(envs)
 

@@ -103,6 +103,14 @@ class RolloutStorage(object):
                 for step in reversed(range(self.rewards.size(0))):
                     self.returns[step] = self.returns[step + 1] * \
                         gamma * self.masks[step + 1] + self.rewards[step]
+        # Let's recast all parallel batches into a single dimension
+        # self.obs = self.obs.view(-1, *self.obs.size()[2:])
+        # self.recurrent_hidden_states = self.recurrent_hidden_states.view(-1, self.recurrent_hidden_states.size(-1))
+        # self.actions = self.actions.view(-1, self.actions.size(-1))
+        # self.value_preds = self.value_preds.view(-1, 1)
+        # self.returns = self.returns.view(-1, 1)
+        # self.masks = self.masks.view(-1, 1)
+        # self.action_log_probs = self.action_log_probs.view(-1, 1)
 
     def feed_forward_generator(self,
                                advantages,
@@ -122,7 +130,7 @@ class RolloutStorage(object):
         sampler = BatchSampler(
             SubsetRandomSampler(range(batch_size)),
             mini_batch_size,
-            drop_last=True)
+                drop_last=True)
         for indices in sampler:
             obs_batch = self.obs[:-1].view(-1, *self.obs.size()[2:])[indices]
             recurrent_hidden_states_batch = self.recurrent_hidden_states[:-1].view(

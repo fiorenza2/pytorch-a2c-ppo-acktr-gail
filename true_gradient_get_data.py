@@ -5,8 +5,6 @@ import pickle
 import time
 from collections import deque
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-
 import gym
 import numpy as np
 import torch
@@ -35,12 +33,12 @@ def main():
     num_mini_batch = 32
     ppo_epoch = 10
     use_proper_time_limits = True
-    num_steps = 10000
+    num_steps = 2000
     # num_baseline_steps = 100
     save_interval = 100
     log_interval = 10
-    num_processes = 20
-    num_env_steps = 100000
+    num_processes = 1
+    num_env_steps = 10000000
     use_linear_lr_decay = True
     clip_param = 0.2
     lr = 1e-4
@@ -114,21 +112,21 @@ def main():
                               envs.observation_space.shape, envs.action_space,
                               actor_critic.recurrent_hidden_state_size)
 
-    with open('./store/rollout-10m.pkl', 'rb') as rollout_file:
-        rollouts_10m = pickle.load(rollout_file)
-
+    rollouts_10m = RolloutStorage(num_env_steps, num_processes,
+                              envs.observation_space.shape, envs.action_space,
+                              actor_critic.recurrent_hidden_state_size)
 
     obs = envs.reset()
     rollouts.obs[0].copy_(obs)
     rollouts.to(device)
+    rollouts_10m.obs[0].copy_(obs)
+    rollouts_10m.to(device)
 
     episode_rewards = deque(maxlen=10)
 
     start = time.time()
     num_updates = int(
         num_env_steps) // num_steps // num_processes
-
-    num_updates = 1
 
     for j in range(num_updates):
 
@@ -159,30 +157,24 @@ def main():
                  for info in infos])
             rollouts.insert(obs, recurrent_hidden_states, action,
                             action_log_prob, value, reward, masks, bad_masks)
+            rollouts_10m.insert(obs, recurrent_hidden_states, action,
+                            action_log_prob, value, reward, masks, bad_masks)
 
         with torch.no_grad():
             next_value = actor_critic.get_value(
                 rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
                 rollouts.masks[-1]).detach()
-            next_value_10m = actor_critic.get_value(
-                rollouts_10m.obs[-1], rollouts_10m.recurrent_hidden_states[-1],
-                rollouts_10m.masks[-1]
-            ).detach()
 
         rollouts.compute_returns(next_value, use_gae, gamma,
                                  gae_lambda, use_proper_time_limits)
-        rollouts_10m.compute_returns(next_value_10m, use_gae, gamma,
-                                 gae_lambda, use_proper_time_limits)
-        
-        grad_full = agent.get_grad_vector(rollouts_10m)
-        grad_est = agent.get_grad_vector(rollouts)
-
-        cosine_sim = torch.nn.functional.cosine_similarity(grad_full, grad_est, dim=0)
-        print("Cosine similarity:", cosine_sim.item())
 
         value_loss, action_loss, dist_entropy = agent.update(rollouts)
 
         rollouts.after_update()
+
+        # with open('./store/rollout-10m.pkl', 'rb') as rollout_file:
+        #     rollouts_test = pickle.load(rollout_file)
+
 
         # save for every interval-th episode or for the last epoch
         # if (j % save_interval == 0
@@ -216,6 +208,14 @@ def main():
         #     ob_rms = utils.get_vec_normalize(envs).ob_rms
         #     evaluate(actor_critic, ob_rms, args.env_name, args.seed,
         #              args.num_processes, eval_log_dir, device)
+    
+    with open('./store/rollout-10m.pkl', 'wb') as rollout_file:
+        try:
+            os.makedirs('./store')
+        except FileExistsError:
+            pass
+        pickle.dump(rollouts_10m, rollout_file)
+
 
 if __name__ == "__main__":
     main()

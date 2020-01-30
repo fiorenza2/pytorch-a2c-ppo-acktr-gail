@@ -30,6 +30,12 @@ class PPO():
         self.use_clipped_value_loss = use_clipped_value_loss
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr, eps=eps)
+        self.lr = lr
+        self.eps = eps
+
+    def reset(self, actor_critic):
+        self.actor_critic = actor_critic
+        self.optimizer = optim.Adam(actor_critic.parameters(), lr=self.lr, eps=self.eps)
 
     def update(self, rollouts):
         advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
@@ -62,7 +68,7 @@ class PPO():
 
         _, _, _ = self.calculate_gradient(rollouts, advantages, update=False, all_data_at_once=True)
 
-        grad = torch.cat([param.grad.view(-1) for param in self.actor_critic.parameters()])
+        grad = torch.cat([param.grad.view(-1) for param in self.actor_critic.base.actor.parameters()])
 
         return grad
 

@@ -5,6 +5,8 @@ import pickle
 import time
 from collections import deque
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+
 import gym
 import numpy as np
 import torch
@@ -33,12 +35,12 @@ def main():
     num_mini_batch = 32
     ppo_epoch = 10
     use_proper_time_limits = True
-    num_steps = 2000
-    # num_baseline_steps = 100
+    num_steps = 100
+    num_baseline_steps = 2500
     save_interval = 100
     log_interval = 10
-    num_processes = 1
-    num_env_steps = 5000000
+    num_processes = 20
+    num_env_steps = 10000000
     use_linear_lr_decay = True
     clip_param = 0.2
     lr = 1e-4
@@ -74,9 +76,26 @@ def main():
         base_kwargs={'recurrent': False})
     actor_critic.to(device)
 
+    actor_critic_oracle = Policy(
+        envs.observation_space.shape,
+        envs.action_space,
+        base_kwargs={'recurrent': False})
+    actor_critic_oracle.to(device)
+
     if mode == 'PPO':
         agent = algo.PPO(
             actor_critic,
+            clip_param,
+            ppo_epoch=ppo_epoch,
+            num_mini_batch=num_mini_batch,
+            value_loss_coef=value_loss_coef,
+            entropy_coef=entropy_coef,
+            lr=lr,
+            eps=eps,
+            max_grad_norm=max_grad_norm)
+        
+        agent_oracle = algo.PPO(
+            actor_critic_oracle,
             clip_param,
             ppo_epoch=ppo_epoch,
             num_mini_batch=num_mini_batch,
@@ -112,21 +131,21 @@ def main():
                               envs.observation_space.shape, envs.action_space,
                               actor_critic.recurrent_hidden_state_size)
 
-    rollouts_5m = RolloutStorage(num_env_steps, num_processes,
+    rollouts_big = RolloutStorage(num_baseline_steps, num_processes,
                               envs.observation_space.shape, envs.action_space,
                               actor_critic.recurrent_hidden_state_size)
 
     obs = envs.reset()
     rollouts.obs[0].copy_(obs)
     rollouts.to(device)
-    rollouts_5m.obs[0].copy_(obs)
-    rollouts_5m.to(device)
 
     episode_rewards = deque(maxlen=10)
 
     start = time.time()
     num_updates = int(
         num_env_steps) // num_steps // num_processes
+
+    num_updates = 1
 
     for j in range(num_updates):
 
@@ -135,7 +154,7 @@ def main():
             utils.update_linear_schedule(
                 agent.optimizer, j, num_updates, lr)
 
-        for step in range(num_steps):
+        for step in range(num_baseline_steps):
             # Sample actions
             with torch.no_grad():
                 value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
@@ -155,26 +174,37 @@ def main():
             bad_masks = torch.FloatTensor(
                 [[0.0] if 'bad_transition' in info.keys() else [1.0]
                  for info in infos])
-            rollouts.insert(obs, recurrent_hidden_states, action,
-                            action_log_prob, value, reward, masks, bad_masks)
-            rollouts_5m.insert(obs, recurrent_hidden_states, action,
-                            action_log_prob, value, reward, masks, bad_masks)
+            if steps < num_steps:
+                rollouts.insert(obs, recurrent_hidden_states, action,
+                                action_log_prob, value, reward, masks, bad_masks)
+            rollouts_big.insert(obs, recurrent_hidden_states, action,
+                                action_log_prob, value, reward, masks, bad_masks)
 
         with torch.no_grad():
             next_value = actor_critic.get_value(
                 rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
                 rollouts.masks[-1]).detach()
+            next_value_big = actor_critic.get_value(
+                rollouts_big.obs[-1], rollouts_big.recurrent_hidden_states[-1],
+                rollouts_big.masks[-1]
+            ).detach()
 
         rollouts.compute_returns(next_value, use_gae, gamma,
                                  gae_lambda, use_proper_time_limits)
+        rollouts_big.compute_returns(next_value_big, False, gamma,
+                                 gae_lambda, use_proper_time_limits)
+        
+        # grad_full = agent.get_grad_vector(rollouts_big)
+        # grad_est = agent.get_grad_vector(rollouts)
+
+        # cosine_sim = torch.nn.functional.cosine_similarity(grad_full, grad_est, dim=0)
+        # print("Cosine similarity:", cosine_sim.item())
 
         value_loss, action_loss, dist_entropy = agent.update(rollouts)
+        value_loss_big, action_loss_big, dist_entropy_big = agent_oracle.update(rollouts_big)
 
         rollouts.after_update()
-
-        # with open('./store/rollout-10m.pkl', 'rb') as rollout_file:
-        #     rollouts_test = pickle.load(rollout_file)
-
+        rollouts_big.after_update()
 
         # save for every interval-th episode or for the last epoch
         # if (j % save_interval == 0
@@ -208,14 +238,6 @@ def main():
         #     ob_rms = utils.get_vec_normalize(envs).ob_rms
         #     evaluate(actor_critic, ob_rms, args.env_name, args.seed,
         #              args.num_processes, eval_log_dir, device)
-    
-    with open('./store/rollout-100k-flat.pkl', 'wb') as rollout_file:
-        try:
-            os.makedirs('./store')
-        except FileExistsError:
-            pass
-        pickle.dump(rollouts_5m, rollout_file, protocol=4)
-
 
 if __name__ == "__main__":
     main()

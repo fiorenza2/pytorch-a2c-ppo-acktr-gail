@@ -37,7 +37,7 @@ def main():
     num_mini_batch = 32
     ppo_epoch = 10
     use_proper_time_limits = True
-    num_steps_list = [200,1000,2000,10000,20000,100000,200000,1000000]
+    num_steps_list = [2000]
     num_baseline_steps = 2500
     save_interval = 100
     log_interval = 10
@@ -126,48 +126,55 @@ def main():
     # num_updates = int(
     #     num_env_steps) // num_steps // num_processes
 
+    actor_critic = Policy(
+        envs.observation_space.shape,
+        envs.action_space,
+        base_kwargs={'recurrent': False})
+    actor_critic.to(device)
+
+    agent = algo.PPO(
+        actor_critic,
+        clip_param,
+        ppo_epoch=ppo_epoch,
+        num_mini_batch=num_mini_batch,
+        value_loss_coef=value_loss_coef,
+        entropy_coef=entropy_coef,
+        lr=lr,
+        eps=eps,
+        max_grad_norm=max_grad_norm)
+
     num_updates = 1
     ave_cos_sims = []
 
     num_steps_list_norm = torch.tensor(num_steps_list) / num_processes
 
-    for num_steps in num_steps_list_norm:
+    num_steps = num_steps_list_norm[0].item()
+    num_steps_true = int(500000 / num_processes)
 
-        num_steps = num_steps.item()
+    rollouts = RolloutStorage(num_steps, num_processes,
+                    envs.observation_space.shape, envs.action_space,
+                    actor_critic.recurrent_hidden_state_size)
 
-        actor_critic = Policy(
-            envs.observation_space.shape,
-            envs.action_space,
-            base_kwargs={'recurrent': False})
-        actor_critic.to(device)
+    rollouts_true = RolloutStorage(num_steps_true, num_processes,
+                    envs.observation_space.shape, envs.action_space,
+                    actor_critic.recurrent_hidden_state_size)
 
-        agent = algo.PPO(
-            actor_critic,
-            clip_param,
-            ppo_epoch=ppo_epoch,
-            num_mini_batch=num_mini_batch,
-            value_loss_coef=value_loss_coef,
-            entropy_coef=entropy_coef,
-            lr=lr,
-            eps=eps,
-            max_grad_norm=max_grad_norm)
+    obs = envs.reset()
+    rollouts.obs[0].copy_(obs)
+    rollouts.to(device)
 
-        rollouts = RolloutStorage(num_steps, num_processes,
-                            envs.observation_space.shape, envs.action_space,
-                            actor_critic.recurrent_hidden_state_size)
+    eval_epoch = 150
 
-        obs = envs.reset()
-        rollouts.obs[0].copy_(obs)
-        rollouts.to(device)
+    for j in range(eval_epoch):
 
         grad_estimates = []
-        for i in range(10):
-            for step in range(num_steps):
+        if j < eval_epoch - 1:
+            for step in range(num_steps_true):
                 # Sample actions
                 with torch.no_grad():
                     value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
-                        rollouts.obs[step], rollouts.recurrent_hidden_states[step],
-                        rollouts.masks[step])
+                        rollouts_true.obs[step], rollouts_true.recurrent_hidden_states[step],
+                        rollouts_true.masks[step])
 
                 # Obser reward and next obs
                 obs, reward, done, infos = envs.step(action)
@@ -182,32 +189,73 @@ def main():
                 bad_masks = torch.FloatTensor(
                     [[0.0] if 'bad_transition' in info.keys() else [1.0]
                     for info in infos])
-                rollouts.insert(obs, recurrent_hidden_states, action,
+                if step < num_steps:
+                    rollouts.insert(obs, recurrent_hidden_states, action,
+                                    action_log_prob, value, reward, masks, bad_masks)
+                rollouts_true.insert(obs, recurrent_hidden_states, action,
                                 action_log_prob, value, reward, masks, bad_masks)
 
             with torch.no_grad():
+                next_value_true = actor_critic.get_value(
+                    rollouts_true.obs[-1], rollouts_true.recurrent_hidden_states[-1],
+                    rollouts_true.masks[-1]).detach()
                 next_value = actor_critic.get_value(
                     rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
                     rollouts.masks[-1]).detach()
-
+            rollouts_true.compute_returns(next_value_true, False, 1.00,
+                                    gae_lambda, use_proper_time_limits)
             rollouts.compute_returns(next_value, use_gae, gamma,
                                     gae_lambda, use_proper_time_limits)
-            
-            grad_estimates.append(agent.get_grad_vector(rollouts))
-
-            # cosine_sim = torch.nn.functional.cosine_similarity(grad_full, grad_est, dim=0)
-            # print("Cosine similarity:", cosine_sim.item())
-
-            if i == 0:
-                value_loss, action_loss, dist_entropy = agent.update(rollouts)
-
+            value_loss, action_loss, dist_entropy = agent.update(rollouts_true, train_only_critic=True)
+            value_loss, action_loss, dist_entropy = agent.update(rollouts, train_critic=False)
             rollouts.after_update()
+            rollouts_true.after_update()
+        else:
+            for _ in range(10):
+                for step in range(num_steps):
+                    # Sample actions
+                    with torch.no_grad():
+                        value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
+                            rollouts.obs[step], rollouts.recurrent_hidden_states[step],
+                            rollouts.masks[step])
 
-        cos_sims = []
-        for a, b in itertools.combinations(grad_estimates, 2):
-            cos_sims.append(torch.nn.functional.cosine_similarity(a, b, dim=0))
-        cos_sims = torch.tensor(cos_sims)
-        ave_cos_sims.append(cos_sims.mean().item())
+                    # Obser reward and next obs
+                    obs, reward, done, infos = envs.step(action)
+
+                    for info in infos:
+                        if 'episode' in info.keys():
+                            episode_rewards.append(info['episode']['r'])
+
+                    # If done then clean the history of observations.
+                    masks = torch.FloatTensor(
+                        [[0.0] if done_ else [1.0] for done_ in done])
+                    bad_masks = torch.FloatTensor(
+                        [[0.0] if 'bad_transition' in info.keys() else [1.0]
+                        for info in infos])
+                    rollouts.insert(obs, recurrent_hidden_states, action,
+                                    action_log_prob, value, reward, masks, bad_masks)
+
+                with torch.no_grad():
+                    next_value = actor_critic.get_value(
+                        rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
+                        rollouts.masks[-1]).detach()
+
+                rollouts.compute_returns(next_value, use_gae, gamma,
+                                        gae_lambda, use_proper_time_limits)
+                
+                grad_estimates.append(agent.get_grad_vector(rollouts))
+
+                # cosine_sim = torch.nn.functional.cosine_similarity(grad_full, grad_est, dim=0)
+                # print("Cosine similarity:", cosine_sim.item())
+
+                rollouts.after_update()
+                rollouts_true.after_update()
+
+            cos_sims = []
+            for a, b in itertools.combinations(grad_estimates, 2):
+                cos_sims.append(torch.nn.functional.cosine_similarity(a, b, dim=0))
+            cos_sims = torch.tensor(cos_sims)
+            ave_cos_sims.append(cos_sims.mean().item())
 
         # save for every interval-th episode or for the last epoch
         # if (j % save_interval == 0
@@ -223,18 +271,18 @@ def main():
         #         getattr(utils.get_vec_normalize(envs), 'ob_rms', None)
         #     ], os.path.join(save_path, args.env_name + ".pt"))
 
-        # if j % log_interval == 0 and len(episode_rewards) > 1:
-        #     total_num_steps = (j + 1) * num_processes * num_steps
-        #     end = time.time()
+        if j % log_interval == 0 and len(episode_rewards) > 1:
+            total_num_steps = (j + 1) * num_processes * num_steps
+            end = time.time()
 
-        #     print(
-        #         "Updates {}, num timesteps {}, FPS {} \n Last {} training episodes: mean/median reward {:.1f}/{:.1f}, min/max reward {:.1f}/{:.1f}\n"
-        #         .format(j, total_num_steps,
-        #                 int(total_num_steps / (end - start)),
-        #                 len(episode_rewards), np.mean(episode_rewards),
-        #                 np.median(episode_rewards), np.min(episode_rewards),
-        #                 np.max(episode_rewards), dist_entropy, value_loss,
-        #                 action_loss))
+            print(
+                "Updates {}, num timesteps {}, FPS {} \n Last {} training episodes: mean/median reward {:.1f}/{:.1f}, min/max reward {:.1f}/{:.1f}\n"
+                .format(j, total_num_steps,
+                        int(total_num_steps / (end - start)),
+                        len(episode_rewards), np.mean(episode_rewards),
+                        np.median(episode_rewards), np.min(episode_rewards),
+                        np.max(episode_rewards), dist_entropy, value_loss,
+                        action_loss))
 
         # if (args.eval_interval is not None and len(episode_rewards) > 1
         #         and j % args.eval_interval == 0):
@@ -242,7 +290,7 @@ def main():
         #     evaluate(actor_critic, ob_rms, args.env_name, args.seed,
         #              args.num_processes, eval_log_dir, device)
     df = pd.DataFrame({'batch_sizes': num_steps_list, 'ave-cos-sim': ave_cos_sims})
-    df.to_csv('./store/variance-grad-cos-sim.csv')
+    df.to_csv('./store/variance-critic-cos-sim.csv')
 
 if __name__ == "__main__":
     main()

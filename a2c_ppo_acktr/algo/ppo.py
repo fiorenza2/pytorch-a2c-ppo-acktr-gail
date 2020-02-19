@@ -30,15 +30,16 @@ class PPO():
         self.use_clipped_value_loss = use_clipped_value_loss
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr, eps=eps)
+        self.actor_optimizer = optim.Adam(actor_critic.base.actor.parameters(), lr=lr, eps=eps)
+        self.critic_optimizer = optim.Adam(actor_critic.base.critic.parameters(), lr=lr, eps=eps)
         self.lr = lr
         self.eps = eps
 
-    def reset(self, actor_critic):
-        self.actor_critic = actor_critic
-        self.optimizer = optim.Adam(actor_critic.parameters(), lr=self.lr, eps=self.eps)
-
-    def update(self, rollouts):
-        advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+    def update(self, rollouts, train_critic=True, use_critic=True, train_only_critic=False):
+        if use_critic:
+            advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+        else:
+            advantages = rollouts.returns[:-1]
         advantages = (advantages - advantages.mean()) / (
             advantages.std() + 1e-5)
 
@@ -47,7 +48,7 @@ class PPO():
         dist_entropy_epoch = 0
 
         for e in range(self.ppo_epoch):
-            value_loss, action_loss, dist_entropy = self.calculate_gradient(rollouts, advantages, update=True)
+            value_loss, action_loss, dist_entropy = self.calculate_gradient(rollouts, advantages, update=True, train_critic=train_critic, train_only_critic=train_only_critic)
 
             value_loss_epoch += value_loss
             action_loss_epoch += action_loss
@@ -61,8 +62,11 @@ class PPO():
 
         return value_loss_epoch, action_loss_epoch, dist_entropy_epoch
 
-    def get_grad_vector(self, rollouts):
-        advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+    def get_grad_vector(self, rollouts, use_critic=True):
+        if use_critic:
+            advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+        else:
+            advantages = rollouts.returns[:-1]
         advantages = (advantages - advantages.mean()) / (
             advantages.std() + 1e-5)
 
@@ -72,7 +76,7 @@ class PPO():
 
         return grad
 
-    def calculate_gradient(self, rollouts, advantages, update=True, all_data_at_once=False):
+    def calculate_gradient(self, rollouts, advantages, update=True, all_data_at_once=False, train_critic=True, train_only_critic=False):
 
         if all_data_at_once:
             num_mini_batch = 1
@@ -124,7 +128,12 @@ class PPO():
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(),
                                         self.max_grad_norm)
             if update:
-                self.optimizer.step()
+                if train_only_critic:
+                    self.critic_optimizer.step()
+                elif train_critic:
+                    self.optimizer.step()
+                else:
+                    self.actor_optimizer.step()
             
             value_loss_total += value_loss.item()
             action_loss_total += action_loss.item()
